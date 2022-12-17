@@ -1,0 +1,103 @@
+#!/bin/bash
+
+parent_path=$(
+  cd "$(dirname "${BASH_SOURCE[0]}")"
+  pwd -P
+)
+
+cd "$parent_path"
+
+eval "$(./shdotenv --env .env || echo "exit $?")"
+
+jq="bin/jq-linux64"
+
+LAST_IP_FILE='ip.txt'
+GET_IP_URL='https://api.myip.com'
+SL_API="https://api.selectel.ru/domains/v1"
+
+if [ -z "$SL_TOKEN" ]; then
+  echo "You haven't specified the selectel.ru API key yet."
+  echo "Please set your key in .env file"
+  exit 1
+fi
+
+LAST_IP=$(cat "${LAST_IP_FILE}")
+
+CURRENT_IP=$(curl -sS "$GET_IP_URL" | $jq --raw-output '.ip')
+echo -e "Current IP: \\e[32m${CURRENT_IP}\\e[0m"
+
+if [ "${LAST_IP}" == "${CURRENT_IP}" ]; then
+  echo -e "\\e[32mThe IP is actual.\\e[0m"
+  exit 0
+fi
+
+function join_by {
+  local IFS="$1"
+  shift
+  echo "$*"
+}
+
+function find_zone() {
+  local DOMAIN="${1}"
+  local ZONELIST=$(
+    curl -sS -H "X-Token: $SL_TOKEN" -H "Content-Type: application/json" \
+      "$SL_API" --connect-timeout 5 | $jq --raw-output '.[].name'
+  )
+  local TESTDOMAIN="${DOMAIN}"
+
+  for zone in $ZONELIST; do
+    if [[ "$zone" == "$TESTDOMAIN" ]]; then
+      echo "$zone"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+function update_record() {
+  local DOMAIN_ID="${1}"
+  local RECORD_ID=$(echo -e "${2}")
+
+  echo "Updating record with ID: ${RECORD_ID}"
+
+  local json='{"type": "A", "content": "'${CURRENT_IP}'"}'
+  local url="${SL_API}/${DOMAIN_ID}/records/${RECORD_ID}"
+
+  res=$(curl -sS -X PUT -H "Content-Type: application/json" -H "X-Token: ${SL_TOKEN}" -d "${json}" "${url}")
+
+  error=$(echo "$res" | $jq '.error')
+  if [[ $error == "null" ]]; then
+    echo -e "\\e[32mSuccess\\e[0m"
+  else
+    echo -e "\\e[33mError\\e[0m"
+  fi
+}
+
+function update_domain() {
+  local DOMAIN="${1}"
+  local ZONE=$(find_zone "${DOMAIN}")
+
+  if [[ -z "$ZONE" ]]; then
+    echo "Domain not found: ${DOMAIN}"
+    exit 1
+  fi
+
+  local check_domains=$(for subd in ${SL_SUBDOMAINS}; do
+    echo \"${subd}.${SL_DOMAIN}\"
+  done)
+  local list=$(join_by , ${check_domains})
+  echo $list
+
+  echo "Getting domain ID for ${DOMAIN}"
+  local DOMAIN_ID=$(curl -sS -H "X-Token: ${SL_TOKEN}" "${SL_API}/${ZONE}" | $jq .id)
+  local RR_IDS=$(curl -sS -H "X-Token: ${SL_TOKEN}" ${SL_API}/${DOMAIN_ID}/records | "${jq}" --raw-output '.[] | select(.name | contains ('${list}')) | .id')
+
+  for RR_ID in ${RR_IDS}; do
+    update_record ${DOMAIN_ID} ${RR_ID}
+  done
+
+  echo "${CURRENT_IP}" >"${LAST_IP_FILE}"
+}
+
+update_domain "${SL_DOMAIN}"
