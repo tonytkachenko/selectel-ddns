@@ -1,103 +1,109 @@
 #!/bin/bash
 
-parent_path=$(
-  cd "$(dirname "${BASH_SOURCE[0]}")"
-  pwd -P
-)
+# Get the directory path of the script
+SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
-cd "$parent_path"
+# File to store the current IP address
+IP_FILE="$SCRIPT_DIR/ip.txt"
 
-eval "$(./shdotenv --env .env || echo "exit $?")"
-
-jq="bin/jq-linux64"
-
-LAST_IP_FILE='ip.txt'
-GET_IP_URL='https://api.myip.com'
-SL_API="https://api.selectel.ru/domains/v1"
-
-if [ -z "$SL_TOKEN" ]; then
-  echo "You haven't specified the selectel.ru API key yet."
-  echo "Please set your key in .env file"
-  exit 1
-fi
-
-LAST_IP=$(cat "${LAST_IP_FILE}")
-
-CURRENT_IP=$(curl -sS "$GET_IP_URL" | $jq --raw-output '.ip')
-echo -e "Current IP: \\e[32m${CURRENT_IP}\\e[0m"
-
-if [ "${LAST_IP}" == "${CURRENT_IP}" ]; then
-  echo -e "\\e[32mThe IP is actual.\\e[0m"
-  exit 0
-fi
-
-function join_by {
-  local IFS="$1"
-  shift
-  echo "$*"
-}
-
-function find_zone() {
-  local DOMAIN="${1}"
-  local ZONELIST=$(
-    curl -sS -H "X-Token: $SL_TOKEN" -H "Content-Type: application/json" \
-      "$SL_API" --connect-timeout 5 | $jq --raw-output '.[].name'
-  )
-  local TESTDOMAIN="${DOMAIN}"
-
-  for zone in $ZONELIST; do
-    if [[ "$zone" == "$TESTDOMAIN" ]]; then
-      echo "$zone"
-      return 0
+function check_requirements {
+  for PROGRAM in jq curl; do
+    if ! [ -x "$(command -v $PROGRAM)" ]; then
+      echo "Error: $PROGRAM is not installed. Please install $PROGRAM before running this script." >&2
+      exit 1
     fi
   done
 
-  return 1
-}
-
-function update_record() {
-  local DOMAIN_ID="${1}"
-  local RECORD_ID=$(echo -e "${2}")
-
-  echo "Updating record with ID: ${RECORD_ID}"
-
-  local json='{"type": "A", "content": "'${CURRENT_IP}'"}'
-  local url="${SL_API}/${DOMAIN_ID}/records/${RECORD_ID}"
-
-  res=$(curl -sS -X PUT -H "Content-Type: application/json" -H "X-Token: ${SL_TOKEN}" -d "${json}" "${url}")
-
-  error=$(echo "$res" | $jq '.error')
-  if [[ $error == "null" ]]; then
-    echo -e "\\e[32mSuccess\\e[0m"
-  else
-    echo -e "\\e[33mError\\e[0m"
-  fi
-}
-
-function update_domain() {
-  local DOMAIN="${1}"
-  local ZONE=$(find_zone "${DOMAIN}")
-
-  if [[ -z "$ZONE" ]]; then
-    echo "Domain not found: ${DOMAIN}"
+  # Check if the .env file exists
+  if [ ! -f "$SCRIPT_DIR/.env" ]; then
+    echo 'Error: .env file not found. Please create a .env file in the same directory as this script.' >&2
     exit 1
   fi
 
-  local check_domains=$(for subd in ${SL_SUBDOMAINS}; do
-    echo \"${subd}.${SL_DOMAIN}\"
-  done)
-  local list=$(join_by , ${check_domains})
-  echo $list
+  source "$SCRIPT_DIR/.env"
 
-  echo "Getting domain ID for ${DOMAIN}"
-  local DOMAIN_ID=$(curl -sS -H "X-Token: ${SL_TOKEN}" "${SL_API}/${ZONE}" | $jq .id)
-  local RR_IDS=$(curl -sS -H "X-Token: ${SL_TOKEN}" ${SL_API}/${DOMAIN_ID}/records | "${jq}" --raw-output '.[] | select(.name | contains ('${list}')) | .id')
+  # Check if the token is set
+  if [ -z "$TOKEN" ]; then
+    echo 'Error: Selectel API token not found in .env file. Please add the token to the .env file.' >&2
+    exit 1
+  fi
 
-  for RR_ID in ${RR_IDS}; do
-    update_record ${DOMAIN_ID} ${RR_ID}
-  done
+  # Check if the domains list is set
+  if [ -z "$DOMAINS" ]; then
+    echo 'Error: Domain list not found in .env file. Please add the domain list to the .env file.' >&2
+    exit 1
+  fi
 
-  echo "${CURRENT_IP}" >"${LAST_IP_FILE}"
+  # Check if the IP file exists
+  if [ ! -f "$IP_FILE" ]; then
+    echo "" >"$IP_FILE"
+  fi
 }
 
-update_domain "${SL_DOMAIN}"
+function get_domain_id {
+  local domain="${1}"
+
+  echo "Getting domain ID for ${domain}"
+  local response=$(curl -sS -H "X-Token: ${TOKEN}" "${API_ENDPOINT}${domain}")
+
+  if [[ $(echo $response | jq -r ".error") != "null" ]]; then
+    error_message=$(echo $response | jq -r ".error")
+    echo "Error obtaining domain id: $error_message" >&2
+    exit 1
+  fi
+
+  local record_id=$(echo $response | jq -r ".id")
+  echo $record_id
+}
+
+function update_record {
+  local domain_id="${1}"
+  local record_id=$(echo "${2}")
+
+  echo "Updating record with ID: ${record_id}"
+
+  local json='{"type": "A", "content": "'${CURRENT_IP}'"}'
+  local url="${API_ENDPOINT}${domain_id}/records/${record_id}"
+
+  local response=$(curl -sS -X PUT -H "X-token: $TOKEN" -H "Content-Type: application/json" -d "${json}" "${url}")
+
+  if [[ $(echo "$response" | jq -r ".error") == "null" ]]; then
+    echo "Record updated" >&2
+    return 0
+  else
+    error_message=$(echo $response | jq -r ".error")
+    echo "Error: $error_message" >&2
+    return 1
+  fi
+}
+
+function update_domain_records {
+  get_domain_id $MAIN_DOMAIN
+  local main_domain_id=$?
+  local url="${API_ENDPOINT}${MAIN_DOMAIN}/records/"
+
+  declare -a domain_names=($DOMAINS)
+  local list=$(IFS=,; echo "${domain_names[*]}")
+
+  local response=$(curl -sS -H "X-Token: ${TOKEN}" -H "Content-Type: application/json" "${url}")
+  local d=$(echo $response | jq -r --arg list $list '.[] | select(.name as $a | $list | index($a)) | select(.type=="A") | .id')
+
+  for resource_id in $d; do
+    update_record ${main_domain_id} ${resource_id}
+  done
+}
+
+check_requirements
+
+EXISTING_IP=$(cat "$IP_FILE")
+CURRENT_IP=$(curl -sS https://checkip.amazonaws.com/)
+echo "Current IP: ${CURRENT_IP}"
+
+if [ "${EXISTING_IP}" == "${CURRENT_IP}" ]; then
+  echo "The IP is actual."
+  exit 0
+fi
+
+update_domain_records
+
+echo "${CURRENT_IP}" >"${IP_FILE}"
